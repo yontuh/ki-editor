@@ -20,6 +20,7 @@ use crate::{
         Context, GlobalMode, GlobalSearchConfig, LocalSearchConfigMode, QuickfixListSource, Search,
     },
     edit::Edit,
+    file_watcher::{FileWatcherEvent, FileWatcherInput},
     frontend::Frontend,
     git::{self},
     grid::{Grid, LineUpdate},
@@ -41,7 +42,7 @@ use crate::{
     search::parse_search_config,
     selection::{CharIndex, SelectionMode},
     syntax_highlight::{HighlightedSpans, SyntaxHighlightRequest, SyntaxHighlightRequestBatchId},
-    thread::SendResult,
+    thread::{Callback, SendResult},
     ui_tree::{ComponentKind, KindedComponent},
 };
 use event::event::Event;
@@ -106,6 +107,7 @@ pub(crate) struct App<T: Frontend> {
     /// This is used for suspending events until the buffer content
     /// is synced between Ki and the host application.
     queued_events: Vec<Event>,
+    file_watcher_input_sender: Option<Sender<FileWatcherInput>>,
 }
 
 const GLOBAL_TITLE_BAR_HEIGHT: u16 = 1;
@@ -148,6 +150,7 @@ impl<T: Frontend> App<T> {
             status_line_components,
             None, // No integration event sender
             options.enable_lsp,
+            options.enable_file_watcher,
             false,
             None,
         )
@@ -163,10 +166,19 @@ impl<T: Frontend> App<T> {
         status_line_components: Vec<StatusLineComponent>,
         integration_event_sender: Option<Sender<crate::integration_event::IntegrationEvent>>,
         enable_lsp: bool,
+        enable_file_watcher: bool,
         is_running_as_embedded: bool,
         persistence: Option<Persistence>,
     ) -> anyhow::Result<App<T>> {
         let dimension = frontend.lock().unwrap().get_terminal_dimension()?;
+        let file_watcher_input_sender = if enable_file_watcher {
+            Some(crate::file_watcher::watch_file_changes(
+                &working_directory.clone(),
+                sender.clone(),
+            )?)
+        } else {
+            None
+        };
         let mut app = App {
             context: Context::new(
                 working_directory.clone(),
@@ -191,6 +203,7 @@ impl<T: Frontend> App<T> {
             integration_event_sender,
             last_prompt_config: None,
             queued_events: Vec::new(),
+            file_watcher_input_sender,
         };
 
         app.restore_session();
@@ -273,6 +286,10 @@ impl<T: Frontend> App<T> {
             }
             AppMessage::NucleoTickDebounced => {
                 self.handle_nucleo_debounced()?;
+                Ok(false)
+            }
+            AppMessage::FileWatcherEvent(event) => {
+                self.handle_file_watcher_event(event)?;
                 Ok(false)
             }
         }
@@ -826,9 +843,7 @@ impl<T: Frontend> App<T> {
             Dispatch::MoveFile { from, to } => self.move_file(from, to)?,
             Dispatch::CopyFile { from, to } => self.copy_file(from, to)?,
             Dispatch::AddPath(path) => self.add_path(path)?,
-            Dispatch::RefreshFileExplorer => self
-                .layout
-                .refresh_file_explorer(&self.working_directory, &self.context)?,
+            Dispatch::RefreshFileExplorer => self.layout.refresh_file_explorer(&self.context)?,
             Dispatch::SetClipboardContent {
                 copied_texts: contents,
             } => self.context.set_clipboard_content(contents)?,
@@ -973,6 +988,9 @@ impl<T: Frontend> App<T> {
 
     fn close_current_window(&mut self) -> anyhow::Result<()> {
         if let Some(removed_path) = self.layout.close_current_window(&self.context) {
+            self.send_file_watcher_input(FileWatcherInput::SyncOpenedPaths(
+                self.layout.get_opened_files(),
+            ));
             if let Some(path) = self.context.unmark_path(removed_path).cloned() {
                 self.open_file(&path, BufferOwner::User, true, true)?;
             }
@@ -1198,9 +1216,9 @@ impl<T: Frontend> App<T> {
                         task: PromptItemsBackgroundTask::NonGitIgnoredFiles { working_directory },
                         on_nucleo_tick_debounced: {
                             let sender = self.sender.clone();
-                            Arc::new(move || {
+                            Callback::new(Arc::new(move |_| {
                                 let _ = sender.send(AppMessage::NucleoTickDebounced);
-                            })
+                            }))
                         },
                     },
                     FilePickerKind::GitStatus(diff_mode) => PromptItems::Precomputed(
@@ -1289,6 +1307,10 @@ impl<T: Frontend> App<T> {
         if self.enable_lsp {
             self.lsp_manager.open_file(path.clone())?;
         }
+
+        self.send_file_watcher_input(FileWatcherInput::SyncOpenedPaths(
+            self.layout.get_opened_files(),
+        ));
         Ok(component)
     }
 
@@ -1713,8 +1735,7 @@ impl<T: Frontend> App<T> {
             std::fs::remove_file(path)?;
         }
         self.layout.remove_suggestive_editor(path);
-        self.layout
-            .refresh_file_explorer(&self.working_directory, &self.context)?;
+        self.layout.refresh_file_explorer(&self.context)?;
         Ok(())
     }
 
@@ -1722,8 +1743,7 @@ impl<T: Frontend> App<T> {
         use std::fs;
         self.add_path_parent(&to)?;
         fs::rename(from.clone(), to.clone())?;
-        self.layout
-            .refresh_file_explorer(&self.working_directory, &self.context)?;
+        self.layout.refresh_file_explorer(&self.context)?;
         let to = to.try_into()?;
 
         self.context.rename_path_mark(&from, &to);
@@ -1745,8 +1765,7 @@ impl<T: Frontend> App<T> {
         use std::fs;
         self.add_path_parent(&to)?;
         fs::copy(from.clone(), to.clone())?;
-        self.layout
-            .refresh_file_explorer(&self.working_directory, &self.context)?;
+        self.layout.refresh_file_explorer(&self.context)?;
         let to = to.try_into()?;
         self.reveal_path_in_explorer(&to)?;
         self.lsp_manager.send_message(
@@ -1775,8 +1794,7 @@ impl<T: Frontend> App<T> {
             self.add_path_parent(&path)?;
             std::fs::File::create(&path)?;
         }
-        self.layout
-            .refresh_file_explorer(&self.working_directory, &self.context)?;
+        self.layout.refresh_file_explorer(&self.context)?;
         let path: CanonicalizedPath = path.try_into()?;
         self.reveal_path_in_explorer(&path)?;
         self.lsp_manager.send_message(
@@ -2227,6 +2245,16 @@ impl<T: Frontend> App<T> {
 
     fn reveal_path_in_explorer(&mut self, path: &CanonicalizedPath) -> anyhow::Result<()> {
         let dispatches = self.layout.reveal_path_in_explorer(path, &self.context)?;
+        self.send_file_watcher_input(FileWatcherInput::SyncFileExplorerExpandedFolders(
+            self.layout
+                .file_explorer_expanded_folders()
+                .into_iter()
+                // Need to include the current working directory (cwd)
+                // otherwise path modifications of files that are parked directly under the cwd
+                // will not refresh the file explorer.
+                .chain(Some(self.context.current_working_directory().clone()))
+                .collect(),
+        ));
         self.handle_dispatches(dispatches)
     }
 
@@ -2755,11 +2783,45 @@ impl<T: Frontend> App<T> {
         &mut self,
         app_message_matcher: &lazy_regex::Lazy<regex::Regex>,
     ) -> anyhow::Result<()> {
-        while let Ok(app_message) = self.receiver.recv() {
-            let string = format!("{app_message:?}");
-            self.process_message(app_message)?;
-            if app_message_matcher.is_match(&string) {
-                break;
+        use std::time::Instant;
+
+        let start_time = Instant::now();
+        let timeout = Duration::from_secs(5);
+        while (Instant::now() - start_time) < timeout {
+            if let Ok(app_message) = self.receiver.try_recv() {
+                let string = format!("{app_message:?}");
+                self.process_message(app_message)?;
+                if app_message_matcher.is_match(&string) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "No app message matching {} is received after {:?}.",
+            app_message_matcher.as_str(),
+            timeout,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expect_app_message_not_received(
+        &mut self,
+        regex: &&'static lazy_regex::Lazy<regex::Regex>,
+        timeout: &Duration,
+    ) -> anyhow::Result<()> {
+        use std::time::Instant;
+
+        let start_time = Instant::now();
+        while &(Instant::now() - start_time) < timeout {
+            if let Ok(app_message) = self.receiver.try_recv() {
+                let string = format!("{app_message:?}");
+                self.process_message(app_message)?;
+                if regex.is_match(&string) {
+                    return Err(anyhow::anyhow!(
+                    "Expected no app message matching {} is received within {timeout:?}, but got {string:?}",
+                    regex.as_str(),
+                ));
+                }
             }
         }
         Ok(())
@@ -2839,6 +2901,39 @@ Conflict markers will be injected in areas that cannot be merged gracefully."
             },
             None,
         )
+    }
+
+    fn handle_file_watcher_event(&mut self, event: FileWatcherEvent) -> anyhow::Result<()> {
+        log::info!("Received file watcher event: {event:?}");
+        match event {
+            FileWatcherEvent::ContentModified(path) => {
+                if path.is_file()
+                    && self
+                        .layout
+                        .get_opened_files()
+                        .iter()
+                        .any(|opened_file| &path == opened_file)
+                {
+                    let component = self.open_file(&path, BufferOwner::User, false, false)?;
+                    let dispatches = component.borrow_mut().editor_mut().reload(false)?;
+                    self.handle_dispatches(dispatches)?;
+                }
+            }
+            FileWatcherEvent::PathCreated
+            | FileWatcherEvent::PathRemoved(_)
+            | FileWatcherEvent::PathRenamed(_) => {
+                self.layout.refresh_file_explorer(&self.context)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_file_watcher_input(&self, input: FileWatcherInput) {
+        if let Some(sender) = self.file_watcher_input_sender.as_ref() {
+            if let Err(error) = sender.send(input) {
+                log::error!("[App::send_file_watcher_input] error = {error:?}")
+            }
+        }
     }
 }
 
@@ -3207,7 +3302,9 @@ pub(crate) enum AppMessage {
     // New variant for external dispatches
     ExternalDispatch(Box<Dispatch>),
     NucleoTickDebounced,
+    FileWatcherEvent(FileWatcherEvent),
 }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DispatchPrompt {
     MoveSelectionByIndex,

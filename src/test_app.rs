@@ -16,6 +16,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 pub(crate) use Dispatch::*;
 pub(crate) use DispatchEditor::*;
@@ -89,6 +90,7 @@ pub(crate) enum Step {
     /// This is to simulate the main event loop,
     /// necessary for testing async features like Global Search
     WaitForAppMessage(&'static lazy_regex::Lazy<regex::Regex>),
+    WaitForDuration(Duration),
 }
 
 impl Step {
@@ -104,6 +106,7 @@ impl Step {
             ExpectCustom(_) => "ExpectCustom(_)".to_string(),
             WaitForAppMessage(regex) => format!("WaitForAppMessage({regex:?})"),
             Shell(command, args) => format!("Shell: {command} {}", args.join(" ")),
+            WaitForDuration(duration) => format!("Wait for duration {duration:?}"),
         }
     }
 }
@@ -174,6 +177,11 @@ pub(crate) enum ExpectKind {
     SelectionExtensionEnabled(bool),
     PromptHistory(PromptHistoryKey, Vec<String>),
     MarkedFiles(Vec<CanonicalizedPath>),
+    /// Similar to `Step::WaitForAppMessage`, but expect the opposites, with a timeout
+    AppMessageNotReceived {
+        matches: &'static lazy_regex::Lazy<regex::Regex>,
+        timeout: Duration,
+    },
 }
 fn log<T: std::fmt::Debug>(s: T) {
     if !is_ci::cached() {
@@ -200,8 +208,10 @@ impl ExpectKind {
             regex: &'static lazy_regex::Lazy<regex::Regex>,
         ) -> (bool, String) {
             let matched = regex.is_match(haystack);
-            let message =
-                format!("Expected the following to matches regex: {regex:?}:\n{haystack}");
+            let message = format!(
+                "Expected the following to matches regex {:?}:\n{haystack}",
+                regex.as_str()
+            );
             (matched, message)
         }
         fn to_vec(strs: &[&str]) -> Vec<String> {
@@ -569,6 +579,10 @@ impl ExpectKind {
                 &app.context().get_marked_files().into_iter().cloned().collect_vec()
             ),
             NoError => (true, String::new()),
+            AppMessageNotReceived { matches, timeout } => {
+                    app.expect_app_message_not_received(matches, timeout)?;
+                    (true, String::new())
+                }
         })
     }
 }
@@ -619,6 +633,7 @@ pub(crate) fn execute_test(callback: impl Fn(State) -> Box<[Step]>) -> anyhow::R
         RunTestOptions {
             enable_lsp: false,
             enable_syntax_highlighting: false,
+            enable_file_watcher: false,
         },
     )?;
     Ok(())
@@ -658,6 +673,7 @@ pub(crate) fn execute_recipe(
         RunTestOptions {
             enable_lsp: false,
             enable_syntax_highlighting: false,
+            enable_file_watcher: false,
         },
     )
 }
@@ -738,6 +754,7 @@ fn execute_test_helper(
                     let output = std::process::Command::new(program).args(args).output();
                     log(output)
                 }
+                WaitForDuration(duration) => std::thread::sleep(*duration),
             };
         }
 
@@ -754,6 +771,7 @@ fn execute_test_helper(
 pub(crate) struct RunTestOptions {
     pub(crate) enable_lsp: bool,
     pub(crate) enable_syntax_highlighting: bool,
+    pub(crate) enable_file_watcher: bool,
 }
 
 fn run_test(
@@ -1933,6 +1951,7 @@ fn quickfix_list_header_should_be_highlighted_as_keyword() -> anyhow::Result<()>
     let options = RunTestOptions {
         enable_lsp: false,
         enable_syntax_highlighting: true,
+        enable_file_watcher: false,
     };
     execute_test_custom(options, |s| {
         Box::new([

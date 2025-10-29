@@ -1321,6 +1321,46 @@ fn delete_extended_selection() -> anyhow::Result<()> {
 }
 
 #[test]
+fn delete_extended_selection_2() -> anyhow::Result<()> {
+    execute_test(move |s| {
+        Box::new([
+            App(OpenFile {
+                path: s.main_rs(),
+                owner: BufferOwner::User,
+                focus: true,
+            }),
+            Editor(SetContent(
+                "
+fn main() {
+    foo
+       .bar(
+           spam
+       );
+}
+"
+                .to_string(),
+            )),
+            Editor(MatchLiteral("spam".to_string())),
+            Editor(SetSelectionMode(IfCurrentNotFound::LookForward, SyntaxNode)),
+            Editor(MoveSelection(Up)),
+            Editor(EnableSelectionExtension),
+            Editor(SetSelectionMode(IfCurrentNotFound::LookForward, Line)),
+            Expect(CurrentSelectedTexts(&[".bar(\n           spam\n       )"])),
+            Editor(Delete),
+            Expect(CurrentSelectedTexts(&[""])),
+            Expect(CurrentComponentContent(
+                "
+fn main() {
+    foo
+       ;
+}
+",
+            )),
+        ])
+    })
+}
+
+#[test]
 fn multicursor_add_all() -> anyhow::Result<()> {
     execute_test(|s| {
         Box::new([
@@ -5425,6 +5465,37 @@ fn gracefully_reload_buffer_when_there_is_conflict() -> anyhow::Result<()> {
             Editor(ReloadFile { force: false }),
             Expect(CurrentComponentTitle(
                 "Failed to save src/main.rs: The content of the file is newer.".to_string(),
+            )),
+        ])
+    })
+}
+
+#[test]
+fn search_prompt_should_show_words_within_file_as_suggestions() -> anyhow::Result<()> {
+    execute_test(move |s| {
+        Box::new([
+            App(TerminalDimensionChanged(Dimension {
+                height: 100,
+                width: 300,
+            })),
+            App(OpenFile {
+                path: s.main_rs(),
+                owner: BufferOwner::User,
+                focus: true,
+            }),
+            Editor(SetContent("snake_case kebab-case camelCase".to_string())),
+            App(OpenSearchPrompt {
+                scope: Scope::Local,
+                if_current_not_found: IfCurrentNotFound::LookForward,
+            }),
+            // The suggested words should include snake_case, kebab-case and camelCase
+            Expect(ExpectKind::CompletionDropdownContent(
+                "
+camelCase
+kebab-case
+snake_case
+"
+                .trim(),
             )),
         ])
     })

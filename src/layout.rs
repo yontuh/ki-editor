@@ -292,14 +292,8 @@ impl Layout {
         self.background_suggestive_editors.shift_remove(path);
     }
 
-    pub(crate) fn refresh_file_explorer(
-        &self,
-        working_directory: &CanonicalizedPath,
-        context: &Context,
-    ) -> anyhow::Result<()> {
-        self.background_file_explorer
-            .borrow_mut()
-            .refresh(working_directory, context)
+    pub(crate) fn refresh_file_explorer(&self, context: &Context) -> anyhow::Result<()> {
+        self.background_file_explorer.borrow_mut().refresh(context)
     }
 
     pub(crate) fn open_file_explorer(&mut self) {
@@ -534,6 +528,10 @@ impl Layout {
     #[cfg(test)]
     pub(crate) fn file_explorer_content(&self) -> String {
         self.background_file_explorer.borrow().content()
+    }
+
+    pub(crate) fn file_explorer_expanded_folders(&self) -> Vec<CanonicalizedPath> {
+        self.background_file_explorer.borrow().expanded_folders()
     }
 
     pub(crate) fn get_quickfix_list_items(
